@@ -1,0 +1,17 @@
+Options -Indexes
+
+# Route /api/* to api.php
+RewriteEngine On
+RewriteRule ^api/(.*)$ api.php/$1 [QSA,L]
+
+# Security headers
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set Referrer-Policy "same-origin"
+</IfModule>
+
+# Protect sensitive files
+<FilesMatch "\.(db|sqlite|sqlite3)$">
+    Require all denied
+</FilesMatch>

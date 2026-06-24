@@ -1,0 +1,11 @@
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+Thumbs.db
+.claude/
+memory/
