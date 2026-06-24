@@ -146,6 +146,7 @@ async function init() {
       if (cv || cd) renderApp();
       await Promise.all([loadVehicles(), loadDashboardData(), loadReport()]);
       renderApp();
+      handleShortcut();
     } else {
       await loadAuthStatus();
       renderAuth();
@@ -153,6 +154,25 @@ async function init() {
   } catch (_) {
     await loadAuthStatus();
     renderAuth();
+  }
+}
+
+// ── Home-screen shortcuts (long-press the app icon) ───────────────────────────
+function handleShortcut() {
+  const shortcut = new URLSearchParams(location.search).get('shortcut');
+  if (!shortcut) return;
+  history.replaceState(history.state, '', location.pathname);
+
+  if (shortcut === 'start-trip') {
+    openStartTrip();
+  } else if (shortcut === 'end-trip') {
+    const pending = state.trips.filter(t => t.status === 'pending');
+    if (pending.length === 1) {
+      openEndTrip(pending[0].id);
+    } else {
+      navigate('trips');
+      if (pending.length === 0) toast('No trip in progress to end', 'error');
+    }
   }
 }
 

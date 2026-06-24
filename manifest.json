@@ -11,6 +11,22 @@
     { "src": "icon-192.php", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
     { "src": "icon-512.php", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
   ],
+  "shortcuts": [
+    {
+      "name": "Start Trip",
+      "short_name": "Start Trip",
+      "description": "Log the start of a trip — vehicle, odometer and location now, finish it later",
+      "url": "./?shortcut=start-trip",
+      "icons": [{ "src": "icon-192.php", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "End Trip",
+      "short_name": "End Trip",
+      "description": "Finish a trip you started earlier",
+      "url": "./?shortcut=end-trip",
+      "icons": [{ "src": "icon-192.php", "sizes": "192x192", "type": "image/png" }]
+    }
+  ],
   "screenshots": [],
   "categories": ["productivity", "finance"],
   "lang": "en-NZ"
