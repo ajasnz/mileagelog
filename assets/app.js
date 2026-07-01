@@ -20,6 +20,52 @@ function cacheSet(key, val) {
   try { localStorage.setItem('ml_' + key, JSON.stringify(val)); } catch (_) {}
 }
 
+// ── Reverse geocoding (Nominatim / OpenStreetMap) ─────────────────────────────
+async function reverseGeocode(lat, lon) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&addressdetails=1&zoom=16`;
+    const res  = await fetch(url, { headers: { 'Accept-Language': 'en' } });
+    if (!res.ok) return null;
+    const data = res.json ? await res.json() : null;
+    if (!data?.address) return null;
+    const a = data.address;
+    // Build a short, human-readable NZ-style string: "Road, Suburb" or "Road, City"
+    const road   = a.road || a.pedestrian || a.path || a.highway || '';
+    const suburb = a.suburb || a.neighbourhood || a.quarter || '';
+    const city   = a.city || a.town || a.village || a.county || '';
+    const parts  = [road, suburb || city].filter(Boolean);
+    return parts.length ? parts.join(', ') : (data.display_name?.split(',').slice(0,2).join(',').trim() || null);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function detectLocation(inputId, placeholderId) {
+  if (!('geolocation' in navigator)) return;
+  const input = document.getElementById(inputId);
+  if (!input || input.value) return;
+  if (placeholderId) {
+    const el = document.getElementById(placeholderId);
+    if (el) el.placeholder = 'Detecting…';
+  }
+  navigator.geolocation.getCurrentPosition(
+    async pos => {
+      const input2 = document.getElementById(inputId);
+      if (!input2 || input2.value) return;
+      const addr = await reverseGeocode(pos.coords.latitude, pos.coords.longitude);
+      if (input2 && !input2.value) {
+        input2.value = addr || `${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)}`;
+        input2.placeholder = '';
+      }
+    },
+    () => {
+      const i = document.getElementById(inputId);
+      if (i && !i.value) i.placeholder = 'e.g. Home office';
+    },
+    { timeout: 10000, enableHighAccuracy: false }
+  );
+}
+
 // ── API helper ────────────────────────────────────────────────────────────────
 const API = 'api.php';
 
@@ -714,16 +760,7 @@ function openStartTrip() {
   el.addEventListener('click', e => { if (e.target === el) closeModal('start-trip-modal'); });
   showModalEl(el);
 
-  if ('geolocation' in navigator) {
-    navigator.geolocation.getCurrentPosition(
-      pos => {
-        const i = document.getElementById('start-trip-location');
-        if (i && !i.value) i.value = `${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)}`;
-      },
-      () => { const i = document.getElementById('start-trip-location'); if (i) i.placeholder = 'e.g. Home office'; },
-      { timeout: 8000 }
-    );
-  }
+  detectLocation('start-trip-location');
 }
 
 async function saveStartTrip(e) {
@@ -783,7 +820,7 @@ async function openEndTrip(id) {
         </div>
         <div class="field">
           <label>End Location</label>
-          <input name="end_location" type="text" placeholder="End location">
+          <input name="end_location" id="end-trip-location" type="text" placeholder="Detecting…">
         </div>
         <div class="field">
           <label>Notes <span class="text-muted text-sm">(optional)</span></label>
@@ -795,6 +832,7 @@ async function openEndTrip(id) {
   `;
   el.addEventListener('click', e => { if (e.target === el) closeModal('end-trip-modal'); });
   showModalEl(el);
+  detectLocation('end-trip-location');
 }
 
 function autoCalcEndDist(startOdo) {
@@ -985,19 +1023,27 @@ function renderReports() {
         <div class="card-subtitle">${fmtDate(d.from)} – ${fmtDate(d.to)} · ${days} days
           ${days >= 90 ? ' <span style="color:var(--green)">✓ 90-day requirement met</span>' : ` <span style="color:var(--accent)">⚠ ${90-days} more days needed for 90-day period</span>`}
         </div>
+        ${(() => {
+          const totalKm    = d.has_odo_data ? d.odo_total_km : parseFloat(d.total_km);
+          const privateKm  = d.has_odo_data ? d.odo_private_km : parseFloat(d.private_km);
+          const businessPct = totalKm > 0 ? (parseFloat(d.business_km) / totalKm * 100).toFixed(1) : '0.0';
+          const privatePct  = (100 - parseFloat(businessPct)).toFixed(1);
+          return `
         <div class="stats-grid mt-16">
-          <div class="stat-card"><div class="stat-label">Total km</div><div class="stat-value">${parseFloat(d.total_km).toFixed(0)}</div></div>
-          <div class="stat-card"><div class="stat-label">Trips</div><div class="stat-value">${d.trip_count}</div></div>
+          <div class="stat-card"><div class="stat-label">Total km${d.has_odo_data ? ' <span class="text-muted" style="font-weight:400;font-size:.7rem">(odo)</span>' : ''}</div><div class="stat-value">${totalKm.toFixed(0)}</div></div>
+          <div class="stat-card"><div class="stat-label">Trips logged</div><div class="stat-value">${d.trip_count}</div></div>
           <div class="stat-card accent"><div class="stat-label">Business km</div><div class="stat-value">${parseFloat(d.business_km).toFixed(0)}</div></div>
-          <div class="stat-card" style="background:#fff3cd"><div class="stat-label">Private km</div><div class="stat-value" style="color:#856404">${parseFloat(d.private_km).toFixed(0)}</div></div>
+          <div class="stat-card" style="background:#fff3cd"><div class="stat-label">Personal km${d.has_odo_data ? ' <span class="text-muted" style="font-weight:400;font-size:.7rem">(est.)</span>' : ''}</div><div class="stat-value" style="color:#856404">${privateKm.toFixed(0)}</div></div>
         </div>
+        ${d.has_odo_data ? `<p class="text-sm text-muted" style="margin-top:8px">Personal km estimated from odometer spread (last odo − first odo − business km). Log personal trips manually if you need an exact breakdown.</p>` : ''}
         <div class="mt-16">
           <div style="display:flex;justify-content:space-between;font-size:.85rem;font-weight:700;margin-bottom:4px">
-            <span class="text-green">Business ${d.business_pct}%</span>
-            <span style="color:#856404">Private ${(100-d.business_pct).toFixed(1)}%</span>
+            <span class="text-green">Business ${businessPct}%</span>
+            <span style="color:#856404">Personal ${privatePct}%</span>
           </div>
-          <div class="pct-bar"><div class="pct-fill" style="width:${d.business_pct}%"></div></div>
-        </div>
+          <div class="pct-bar"><div class="pct-fill" style="width:${businessPct}%"></div></div>
+        </div>`;
+        })()}
       </div>
 
       ${d.business_km > 0 && d.deductions?.length === 0 ? `
@@ -1026,6 +1072,7 @@ function renderReports() {
                 <div style="font-weight:700">${escHtml(vName)}</div>
                 <div class="text-sm text-muted">Tax year ending ${row.tax_year} · ${escHtml(FUEL_LABELS[row.fuel_type]||row.fuel_type)}</div>
                 <div class="text-sm text-muted">${row.period_business_km} business km in period · ${tierNote}</div>
+                <div class="text-sm text-muted">Full year: ${row.year_total_km} km total${row.year_total_from_odo ? ' (from odometer)' : ' (logged trips)'} · ${row.year_business_km} km business</div>
               </div>
               <div style="font-size:1.3rem;font-weight:800;color:var(--green)">${fmtCur(row.deduction)}</div>
             </div>

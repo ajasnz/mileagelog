@@ -617,11 +617,19 @@ if ($resource === 'reports') {
         foreach ($vtData as $vid => $taxYears) {
             foreach ($taxYears as $ty => $data) {
                 // Fetch FULL tax-year km for accurate tier determination
+                // Prefer odometer spread (captures unlogged personal trips) over sum of logged trips
                 $yearFrom = ($ty - 1) . '-04-01';
                 $yearTo   = $ty . '-03-31';
+                $odo = $db->prepare("SELECT MIN(start_odometer) AS first_odo, MAX(end_odometer) AS last_odo FROM trips WHERE vehicle_id=? AND user_id=? AND date>=? AND date<=? AND (start_odometer IS NOT NULL OR end_odometer IS NOT NULL)");
+                $odo->execute([$vid, $uid, $yearFrom, $yearTo]);
+                $odoRow = $odo->fetch();
+                $firstOdo = $odoRow['first_odo'] !== null ? (float)$odoRow['first_odo'] : null;
+                $lastOdo  = $odoRow['last_odo']  !== null ? (float)$odoRow['last_odo']  : null;
+                $odoYearKm = ($firstOdo !== null && $lastOdo !== null && $lastOdo > $firstOdo) ? ($lastOdo - $firstOdo) : null;
+
                 $ys = $db->prepare("SELECT COALESCE(SUM(distance),0) AS total_km FROM trips WHERE vehicle_id=? AND user_id=? AND date>=? AND date<=?");
                 $ys->execute([$vid, $uid, $yearFrom, $yearTo]);
-                $yearTotalKm = (float)$ys->fetchColumn();
+                $yearTotalKm = $odoYearKm ?? (float)$ys->fetchColumn();
 
                 $ft   = $data['fuel_type'];
                 $rate = $rates[$ty][$ft] ?? null;
@@ -655,6 +663,7 @@ if ($resource === 'reports') {
                     'rate_standard'     => $rate['rate_standard'],
                     'rate_over14k'      => $rate['rate_over14k'],
                     'year_total_km'     => round($yearTotalKm, 1),
+                    'year_total_from_odo' => $odoYearKm !== null,
                     'year_business_km'  => round($yearBusinessKm, 1),
                     'period_business_km'=> round($periodBusiness, 1),
                     'deduction'         => round($periodDeduction, 2),
@@ -665,6 +674,41 @@ if ($resource === 'reports') {
 
         $summary['deductions']       = $deductions;
         $summary['total_deduction']  = round(array_sum(array_column($deductions, 'deduction')), 2);
+
+        // ── Odometer-derived totals for inferred private km ──────────────────
+        // Personal trips are optional; derive total vehicle use from odo spread
+        $odoStmt = $db->prepare("
+            SELECT t.vehicle_id, v.name AS vehicle_name,
+                   MIN(t.start_odometer) AS first_odo,
+                   MAX(t.end_odometer)   AS last_odo
+            FROM trips t JOIN vehicles v ON t.vehicle_id = v.id
+            WHERE {$wSql}
+              AND (t.start_odometer IS NOT NULL OR t.end_odometer IS NOT NULL)
+            GROUP BY t.vehicle_id
+        ");
+        $odoStmt->execute($params);
+        $odoTotalKm  = 0.0;
+        $odoVehicles = [];
+        foreach ($odoStmt->fetchAll() as $row) {
+            $firstOdo = $row['first_odo'] !== null ? (float)$row['first_odo'] : null;
+            $lastOdo  = $row['last_odo']  !== null ? (float)$row['last_odo']  : null;
+            $odoKm    = ($firstOdo !== null && $lastOdo !== null && $lastOdo > $firstOdo)
+                        ? round($lastOdo - $firstOdo, 1) : null;
+            $odoVehicles[] = [
+                'vehicle_id'   => (int)$row['vehicle_id'],
+                'vehicle_name' => $row['vehicle_name'],
+                'first_odo'    => $firstOdo,
+                'last_odo'     => $lastOdo,
+                'odo_km'       => $odoKm,
+            ];
+            if ($odoKm !== null) $odoTotalKm += $odoKm;
+        }
+        $hasOdoData = $odoTotalKm > 0;
+        $summary['has_odo_data']   = $hasOdoData;
+        $summary['odo_total_km']   = $hasOdoData ? round($odoTotalKm, 1) : null;
+        $summary['odo_private_km'] = $hasOdoData
+            ? max(0.0, round($odoTotalKm - (float)$summary['business_km'], 1)) : null;
+        $summary['odo_vehicles']   = $odoVehicles;
 
         jsonResponse($summary);
     }
