@@ -458,6 +458,9 @@ function tripCard(t) {
   const pending  = t.status === 'pending';
   const billable = t.billable ? `<span class="badge" style="background:#e0f2fe;color:#0369a1;font-size:.65rem">Billable</span>` : '';
   const pendingBadge = pending ? `<span class="badge" style="background:#fff3cd;color:#856404;font-size:.65rem">In Progress</span>` : '';
+  const legBadge = t.trip_group_id
+    ? `<span class="badge" style="background:#e0e7ff;color:#4338ca;font-size:.65rem">${t.is_return_leg ? '↩ Return leg' : 'Leg ' + (t.leg_order||1)}</span>`
+    : '';
   const client   = t.client_name ? `<span class="text-muted"> · ${escHtml(t.client_name)}</span>` : '';
   const inBtn    = (!pending && t.trip_type === 'business')
     ? `<button class="btn btn-sm btn-secondary" style="margin-top:6px;font-size:.72rem" onclick="event.stopPropagation();openInExpenseModal(${t.id})">⚡ Send to Invoice Ninja</button>`
@@ -469,7 +472,7 @@ function tripCard(t) {
     <div class="trip-item" onclick="${pending ? `openEndTrip(${t.id})` : `openEditTrip(${t.id})`}">
       <div class="trip-type-dot ${t.trip_type}"></div>
       <div class="trip-info">
-        <div class="trip-purpose">${escHtml(t.purpose || 'Private trip')} ${billable}${pendingBadge}</div>
+        <div class="trip-purpose">${escHtml(t.purpose || 'Private trip')} ${billable}${pendingBadge}${legBadge}</div>
         <div class="trip-meta">${fmtDate(t.date)} · ${escHtml(t.vehicle_name||'')}${client}</div>
         ${t.start_location||t.end_location ? `<div class="trip-meta" style="font-size:.72rem">${escHtml(t.start_location||'')}${t.start_location&&t.end_location?' → ':''}${escHtml(t.end_location||'')}</div>` : ''}
         ${inBtn}${endBtn}
@@ -556,10 +559,9 @@ function showTripModal(id, data = {}) {
 
         <div class="field">
           <label>Purpose <span id="purpose-req" class="text-sm text-muted">${isBiz?'*':'(optional)'}</span></label>
-          <input name="purpose" type="text" value="${escAttr(data.purpose||'')}" placeholder="e.g. Client visit" ${isBiz?'required':''} autocomplete="off" list="purpose-suggestions" oninput="filterSuggestions(this.value)">
-          <datalist id="purpose-suggestions"></datalist>
-          <div class="suggestions" id="suggestions">
-            ${PURPOSES.map(p => `<button type="button" class="suggest-chip" onclick="selectPurpose('${escAttr(p)}')">${escHtml(p)}</button>`).join('')}
+          <input name="purpose" type="text" value="${escAttr(data.purpose||'')}" placeholder="e.g. Client visit" ${isBiz?'required':''} autocomplete="off" oninput="filterChips('purpose-chips', this.value)">
+          <div class="suggestions" id="purpose-chips">
+            ${suggestChipsHtml(PURPOSES, 'purpose')}
           </div>
         </div>
 
@@ -567,8 +569,8 @@ function showTripModal(id, data = {}) {
           <div class="field-row">
             <div class="field">
               <label>Client Name</label>
-              <input name="client_name" type="text" value="${escAttr(data.client_name||'')}" placeholder="e.g. Acme Ltd" list="client-suggestions" autocomplete="off">
-              <datalist id="client-suggestions"></datalist>
+              <input name="client_name" type="text" value="${escAttr(data.client_name||'')}" placeholder="e.g. Acme Ltd" autocomplete="off" oninput="filterChips('client-chips', this.value)">
+              <div class="suggestions" id="client-chips"></div>
             </div>
             <div class="field" style="flex:0 0 auto;min-width:110px">
               <label>&nbsp;</label>
@@ -603,9 +605,24 @@ function showTripModal(id, data = {}) {
         </div>
 
         <div class="field">
-          <label>Distance (km) *</label>
-          <input name="distance" type="number" step="0.1" min="0.1" value="${data.distance||''}" required placeholder="e.g. 65.0" id="dist-input">
+          <label id="dist-label">Distance (km) *</label>
+          <input name="distance" type="number" step="0.1" min="0.1" value="${data.distance||''}" required placeholder="e.g. 65.0" id="dist-input" oninput="autoCalcDist()">
         </div>
+
+        ${!isEdit ? `
+        <div class="field">
+          <label class="checkbox-label">
+            <input type="checkbox" id="return-trip-cb" onchange="toggleReturnTrip(this.checked)">
+            <span>Return trip <span class="text-muted text-sm">(auto-log the trip back, split evenly)</span></span>
+          </label>
+        </div>
+        <div id="legs-section">
+          <div id="legs-list"></div>
+          <button type="button" class="btn btn-sm btn-secondary" id="add-leg-btn" onclick="addLeg()">+ Add another leg</button>
+        </div>
+        ` : (data.trip_group_id ? `
+        <div class="field text-sm text-muted">${data.is_return_leg ? '↩ Return leg' : 'Leg ' + (data.leg_order||1)} of a multi-leg trip (id ${escHtml(data.trip_group_id)}). Other legs are edited separately.</div>
+        ` : '')}
 
         <div class="field">
           <label>Notes <span class="text-muted text-sm">(optional)</span></label>
@@ -619,25 +636,52 @@ function showTripModal(id, data = {}) {
   `;
   el.addEventListener('click', e => { if (e.target === el) closeModal('trip-modal'); });
   showModalEl(el);
+  state.tripLegs = [];
 
-  // Populate client/purpose autocomplete instantly from cache, then refresh from server
-  populateDatalist('client-suggestions', cacheGet('known_clients') || []);
-  populateDatalist('purpose-suggestions', cacheGet('known_purposes') || []);
+  // Populate client/purpose chip suggestions instantly from cache, then refresh from server
+  populateChips('client-chips', cacheGet('known_clients') || [], 'client_name');
+  mergeChips('purpose-chips', PURPOSES, cacheGet('known_purposes') || [], 'purpose');
   api('GET', 'trips/clients').then(names => {
     cacheSet('known_clients', names);
-    populateDatalist('client-suggestions', names);
+    populateChips('client-chips', names, 'client_name');
   }).catch(() => {});
   api('GET', 'trips/purposes').then(names => {
     cacheSet('known_purposes', names);
-    populateDatalist('purpose-suggestions', names);
+    mergeChips('purpose-chips', PURPOSES, names, 'purpose');
   }).catch(() => {});
 }
 
-function populateDatalist(id, names) {
-  const dl = document.getElementById(id);
-  if (!dl) return;
-  dl.innerHTML = names.map(n => `<option value="${escAttr(n)}">`).join('');
+// ── Chip-based suggestions (in-flow, not a native popup — avoids the mobile
+// keyboard-overlay issue that <input list> / <datalist> popups have) ──────────
+function suggestChipsHtml(items, fieldName) {
+  return items.map(p => `<button type="button" class="suggest-chip" onclick="selectChip('${fieldName}','${escAttr(p)}')">${escHtml(p)}</button>`).join('');
 }
+function populateChips(containerId, names, fieldName) {
+  const c = document.getElementById(containerId);
+  if (!c) return;
+  c.innerHTML = suggestChipsHtml(names, fieldName);
+}
+function mergeChips(containerId, staticItems, dynamicItems, fieldName) {
+  const seen = new Set();
+  const merged = [];
+  [...staticItems, ...dynamicItems].forEach(n => {
+    const key = n.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); merged.push(n); }
+  });
+  populateChips(containerId, merged, fieldName);
+}
+function filterChips(containerId, val) {
+  const lo = val.toLowerCase();
+  document.querySelectorAll(`#${containerId} .suggest-chip`).forEach(c => {
+    c.style.display = !val || c.textContent.toLowerCase().includes(lo) ? '' : 'none';
+  });
+}
+function selectChip(fieldName, val) {
+  const i = document.querySelector(`[name=${fieldName}]`);
+  if (i) { i.value = val; i.dispatchEvent(new Event('input')); }
+}
+function filterSuggestions(val) { filterChips('purpose-chips', val); }
+function selectPurpose(p) { selectChip('purpose', p); }
 
 function setTripType(type) {
   document.getElementById('trip-type-hidden').value = type;
@@ -657,14 +701,66 @@ function autoCalcDist() {
     const di = document.getElementById('dist-input');
     if (di) di.value = (e - s).toFixed(1);
   }
+  renderLegs();
 }
-function filterSuggestions(val) {
-  const lo = val.toLowerCase();
-  document.querySelectorAll('.suggest-chip').forEach(c => { c.style.display = !val || c.textContent.toLowerCase().includes(lo) ? '' : 'none'; });
+
+// ── Return trip / multi-leg trip handling ──────────────────────────────────────
+// A "leg" here is an extra destination beyond From→To, each with its own distance.
+// The From/To/Distance fields above always describe leg 1.
+function toggleReturnTrip(checked) {
+  const addBtn = document.getElementById('add-leg-btn');
+  const distLabel = document.getElementById('dist-label');
+  if (checked) {
+    state.tripLegs = [];
+    if (addBtn) addBtn.style.display = 'none';
+    if (distLabel) distLabel.innerHTML = 'Total round-trip distance (km) *';
+  } else {
+    if (addBtn) addBtn.style.display = '';
+    if (distLabel) distLabel.innerHTML = 'Distance (km) *';
+  }
+  renderLegs();
 }
-function selectPurpose(p) {
-  const i = document.querySelector('[name=purpose]');
-  if (i) { i.value = p; filterSuggestions(p); }
+
+function addLeg() {
+  const cb = document.getElementById('return-trip-cb');
+  if (cb?.checked) return;
+  state.tripLegs.push({ end_location: '', distance: '' });
+  renderLegs();
+}
+function removeLeg(idx) {
+  state.tripLegs.splice(idx, 1);
+  renderLegs();
+}
+function updateLeg(idx, field, val) {
+  if (state.tripLegs[idx]) state.tripLegs[idx][field] = val;
+}
+
+function renderLegs() {
+  const c = document.getElementById('legs-list');
+  if (!c) return;
+  const isReturn = document.getElementById('return-trip-cb')?.checked;
+  const from   = document.querySelector('[name=start_location]')?.value || 'start';
+  const to     = document.querySelector('[name=end_location]')?.value   || 'destination';
+  const total  = parseFloat(document.getElementById('dist-input')?.value);
+
+  if (isReturn) {
+    const half = !isNaN(total) ? (total / 2).toFixed(1) : '—';
+    c.innerHTML = `<p class="text-sm text-muted mt-8">Leg 1: ${escHtml(from)} → ${escHtml(to)} (${half} km) · Leg 2 (auto): ${escHtml(to)} → ${escHtml(from)} (${half} km)</p>`;
+    return;
+  }
+  c.innerHTML = state.tripLegs.map((leg, i) => `
+    <div class="mt-8" style="display:flex;gap:8px;align-items:flex-end">
+      <div class="field" style="flex:1;margin-bottom:0">
+        <label class="text-sm">Leg ${i+2} — To</label>
+        <input type="text" value="${escAttr(leg.end_location)}" placeholder="Next destination" oninput="updateLeg(${i},'end_location',this.value)">
+      </div>
+      <div class="field" style="flex:0 0 90px;margin-bottom:0">
+        <label class="text-sm">Distance</label>
+        <input type="number" step="0.1" min="0.1" value="${escAttr(leg.distance)}" placeholder="km" oninput="updateLeg(${i},'distance',this.value)">
+      </div>
+      <button type="button" class="btn btn-icon btn-danger" onclick="removeLeg(${i})" title="Remove leg">✕</button>
+    </div>
+  `).join('');
 }
 
 async function saveTrip(e, id) {
@@ -672,25 +768,58 @@ async function saveTrip(e, id) {
   const f   = e.target;
   const btn = document.getElementById('save-trip-btn');
   btn.innerHTML = '<span class="spinner"></span>';
-  const body = {
+
+  const isReturn = document.getElementById('return-trip-cb')?.checked;
+  const distance = parseFloat(f.distance.value);
+
+  const base = {
     vehicle_id:     parseInt(f.vehicle_id.value),
     date:           f.date.value,
     trip_type:      f.trip_type.value,
     purpose:        f.purpose.value,
     client_name:    f.client_name?.value || null,
     billable:       f.billable?.checked ? 1 : 0,
-    start_location: f.start_location?.value || null,
-    end_location:   f.end_location?.value || null,
-    distance:       parseFloat(f.distance.value),
-    start_odometer: f.start_odometer.value ? parseFloat(f.start_odometer.value) : null,
-    end_odometer:   f.end_odometer.value   ? parseFloat(f.end_odometer.value)   : null,
     notes:          f.notes.value || null,
   };
+
   try {
-    if (id) { await api('PUT', `trips/${id}`, body); }
-    else if (navigator.onLine) { await api('POST', 'trips', body); }
-    else { await queueTrip(body); toast('Saved offline — will sync when connected', 'success', 4000); }
-    state.lastVehicleId = body.vehicle_id;
+    if (!id && (isReturn || state.tripLegs.length > 0)) {
+      // Multi-leg / return trip: create a chain of linked trip rows.
+      let legs;
+      if (isReturn) {
+        const half = distance / 2;
+        legs = [
+          { end_location: f.end_location?.value || null, distance: half },
+          { end_location: f.start_location?.value || null, distance: half, is_return: 1 },
+        ];
+      } else {
+        legs = [
+          { end_location: f.end_location?.value || null, distance },
+          ...state.tripLegs.map(l => ({ end_location: l.end_location || null, distance: parseFloat(l.distance) })),
+        ];
+      }
+      const body = {
+        ...base,
+        start_location: f.start_location?.value || null,
+        start_odometer: f.start_odometer.value ? parseFloat(f.start_odometer.value) : null,
+        legs,
+      };
+      await api('POST', 'trips/group', body);
+      state.tripLegs = [];
+    } else {
+      const body = {
+        ...base,
+        start_location: f.start_location?.value || null,
+        end_location:   f.end_location?.value || null,
+        distance,
+        start_odometer: f.start_odometer.value ? parseFloat(f.start_odometer.value) : null,
+        end_odometer:   f.end_odometer.value   ? parseFloat(f.end_odometer.value)   : null,
+      };
+      if (id) { await api('PUT', `trips/${id}`, body); }
+      else if (navigator.onLine) { await api('POST', 'trips', body); }
+      else { await queueTrip(body); toast('Saved offline — will sync when connected', 'success', 4000); }
+    }
+    state.lastVehicleId = base.vehicle_id;
     closeModal('trip-modal');
     toast(id ? 'Trip updated' : 'Trip logged!');
     await loadTrips();
@@ -737,13 +866,13 @@ function openStartTrip() {
         </div>
         <div class="field">
           <label>Trip Name / Purpose</label>
-          <input name="purpose" type="text" placeholder="e.g. Client visit" list="purpose-suggestions" autocomplete="off">
-          <datalist id="purpose-suggestions">${(cacheGet('known_purposes')||[]).map(n => `<option value="${escAttr(n)}">`).join('')}</datalist>
+          <input name="purpose" type="text" placeholder="e.g. Client visit" autocomplete="off" oninput="filterChips('start-purpose-chips', this.value)">
+          <div class="suggestions" id="start-purpose-chips">${suggestChipsHtml([...new Set([...PURPOSES, ...(cacheGet('known_purposes')||[])])], 'purpose')}</div>
         </div>
         <div class="field">
           <label>Client Name</label>
-          <input name="client_name" type="text" placeholder="e.g. Acme Ltd" list="client-suggestions" autocomplete="off">
-          <datalist id="client-suggestions">${(cacheGet('known_clients')||[]).map(n => `<option value="${escAttr(n)}">`).join('')}</datalist>
+          <input name="client_name" type="text" placeholder="e.g. Acme Ltd" autocomplete="off" oninput="filterChips('start-client-chips', this.value)">
+          <div class="suggestions" id="start-client-chips">${suggestChipsHtml(cacheGet('known_clients')||[], 'client_name')}</div>
         </div>
         <div class="field">
           <label>Start Odo <span class="text-muted text-sm">(km)</span></label>

@@ -442,6 +442,65 @@ if ($resource === 'trips') {
     $uid = requireAuth();
     $db  = getDb();
 
+    // Multi-leg / return trip: create a chain of trip rows sharing one trip_group_id.
+    // Each leg's start_location/start_odometer is chained from the previous leg's end.
+    if (isset($segments[1]) && $segments[1] === 'group' && $method === 'POST') {
+        $d    = input();
+        $legs = $d['legs'] ?? [];
+        if (empty($d['vehicle_id']) || empty($d['date']) || !is_array($legs) || count($legs) < 1) {
+            jsonResponse(['error' => 'vehicle_id, date, and at least one leg are required'], 422);
+        }
+        $tripType = in_array($d['trip_type'] ?? 'business', ['business','private']) ? $d['trip_type'] : 'business';
+        if ($tripType === 'business' && empty($d['purpose'])) {
+            jsonResponse(['error' => 'Purpose is required for business trips'], 422);
+        }
+        $chk = $db->prepare('SELECT id FROM vehicles WHERE id=? AND user_id=?');
+        $chk->execute([(int)$d['vehicle_id'], $uid]);
+        if (!$chk->fetch()) jsonResponse(['error' => 'Vehicle not found'], 404);
+
+        foreach ($legs as $leg) {
+            if (empty($leg['distance']) || (float)$leg['distance'] <= 0) {
+                jsonResponse(['error' => 'Each leg needs a distance greater than 0'], 422);
+            }
+        }
+
+        $groupId = bin2hex(random_bytes(6));
+        $stmt = $db->prepare('INSERT INTO trips (vehicle_id, user_id, date, start_odometer, end_odometer, distance, purpose, trip_type, client_name, billable, start_location, end_location, notes, status, trip_group_id, leg_order, is_return_leg) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+
+        $prevLocation = $d['start_location'] ?? null;
+        $prevOdo      = isset($d['start_odometer']) ? (float)$d['start_odometer'] : null;
+        $created      = [];
+
+        foreach ($legs as $i => $leg) {
+            $distance = (float)$leg['distance'];
+            $endLoc   = $leg['end_location'] ?? null;
+            $endOdo   = $prevOdo !== null ? $prevOdo + $distance : null;
+
+            $stmt->execute([
+                (int)$d['vehicle_id'], $uid,
+                $d['date'],
+                $prevOdo, $endOdo, $distance,
+                $d['purpose'] ?? '',
+                $tripType,
+                $d['client_name'] ?? null,
+                !empty($d['billable']) ? 1 : 0,
+                $prevLocation, $endLoc,
+                $d['notes'] ?? null,
+                'completed',
+                $groupId, $i + 1,
+                !empty($leg['is_return']) ? 1 : 0,
+            ]);
+            $created[] = (int)$db->lastInsertId();
+            $prevLocation = $endLoc;
+            $prevOdo      = $endOdo;
+        }
+
+        $placeholders = implode(',', array_fill(0, count($created), '?'));
+        $out = $db->prepare("SELECT t.*, v.name AS vehicle_name, v.fuel_type FROM trips t JOIN vehicles v ON t.vehicle_id=v.id WHERE t.id IN ({$placeholders}) ORDER BY t.leg_order");
+        $out->execute($created);
+        jsonResponse($out->fetchAll(), 201);
+    }
+
     if ($method === 'GET' && $id === null) {
         $where  = ['t.user_id = ?'];
         $params = [$uid];

@@ -117,12 +117,17 @@ function initSchema(PDO $db): void {
         ['trips',    'start_location', "ALTER TABLE trips    ADD COLUMN start_location TEXT"],
         ['trips',    'end_location',   "ALTER TABLE trips    ADD COLUMN end_location   TEXT"],
         ['trips',    'status',         "ALTER TABLE trips    ADD COLUMN status         TEXT DEFAULT 'completed'"],
+        ['trips',    'trip_group_id',  "ALTER TABLE trips    ADD COLUMN trip_group_id  TEXT"],
+        ['trips',    'leg_order',      "ALTER TABLE trips    ADD COLUMN leg_order      INTEGER"],
+        ['trips',    'is_return_leg',  "ALTER TABLE trips    ADD COLUMN is_return_leg  INTEGER DEFAULT 0"],
     ];
     foreach ($colMigrations as [$table, $col, $sql]) {
         if (!columnExists($db, $table, $col)) {
             $db->exec($sql);
         }
     }
+
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_trips_group ON trips(trip_group_id)");
 
     // ── Promote first-ever user to admin if no admin exists ──────────────────
     $db->exec("
