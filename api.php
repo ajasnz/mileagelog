@@ -4,6 +4,7 @@ ini_set('display_errors', '0');
 error_reporting(E_ALL);
 
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/webauthn.php'; // no side effects until a passkey route is actually hit
 
 // Keep users signed in across app restarts/closes (30-day persistent session cookie)
 session_set_cookie_params([
@@ -222,6 +223,119 @@ if ($resource === 'auth') {
         }
         $db->prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0, totp_backup_codes = NULL WHERE id = ?')
            ->execute([$uid]);
+        jsonResponse(['ok' => true]);
+    }
+
+    // ── Passkeys (WebAuthn) — see webauthn.php header for setup requirements ──
+    if ($action === 'passkey' && $method === 'GET' && !isset($segments[2])) {
+        $uid  = requireAuth();
+        $db   = getDb();
+        $stmt = $db->prepare('SELECT id, label, created_at, last_used_at FROM webauthn_credentials WHERE user_id = ? ORDER BY created_at DESC');
+        $stmt->execute([$uid]);
+        jsonResponse($stmt->fetchAll());
+    }
+
+    if ($action === 'passkey' && $method === 'DELETE' && isset($segments[2]) && ctype_digit($segments[2])) {
+        $uid = requireAuth();
+        $db  = getDb();
+        $db->prepare('DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?')->execute([(int)$segments[2], $uid]);
+        jsonResponse(['ok' => true]);
+    }
+
+    if ($action === 'passkey' && ($segments[2] ?? '') === 'register-options' && $method === 'POST') {
+        $uid = requireAuth();
+        webauthnRequireAvailable();
+        $db   = getDb();
+        $stmt = $db->prepare('SELECT id, username FROM users WHERE id = ?');
+        $stmt->execute([$uid]);
+        $user = $stmt->fetch();
+
+        $server     = webauthnServer($db);
+        $userEntity = webauthnUserEntity($user);
+        // Exclude already-registered credentials so the same authenticator can't be added twice.
+        $exclude = array_map(
+            fn($src) => $src->getPublicKeyCredentialDescriptor(),
+            webauthnRepository($db)->findAllForUserEntity($userEntity)
+        );
+
+        $options = $server->generatePublicKeyCredentialCreationOptions(
+            $userEntity,
+            \Webauthn\PublicKeyCredentialCreationOptions::ATTESTATION_CONVEYANCE_PREFERENCE_NONE,
+            $exclude
+        );
+        $_SESSION['webauthn_reg_options'] = $options;
+        jsonResponse(json_decode(json_encode($options), true));
+    }
+
+    if ($action === 'passkey' && ($segments[2] ?? '') === 'register' && $method === 'POST') {
+        $uid = requireAuth();
+        webauthnRequireAvailable();
+        if (empty($_SESSION['webauthn_reg_options'])) jsonResponse(['error' => 'No registration in progress'], 400);
+
+        $db     = getDb();
+        $server = webauthnServer($db);
+        $body   = input();
+
+        try {
+            $source = $server->loadAndCheckAttestationResponse(
+                json_encode($body['credential'] ?? []),
+                $_SESSION['webauthn_reg_options'],
+                webauthnPsrRequest()
+            );
+        } catch (\Throwable $e) {
+            jsonResponse(['error' => 'Could not verify passkey — please try again'], 422);
+        }
+        unset($_SESSION['webauthn_reg_options']);
+
+        // saveCredentialSource is an idempotent upsert, safe to call even if the
+        // library already persisted it internally during verification.
+        webauthnRepository($db)->saveCredentialSource($source);
+        $label = trim((string)($body['label'] ?? '')) ?: 'Passkey';
+        $db->prepare('UPDATE webauthn_credentials SET label = ? WHERE credential_id = ?')
+           ->execute([$label, base64_encode($source->publicKeyCredentialId)]);
+
+        jsonResponse(['ok' => true]);
+    }
+
+    if ($action === 'passkey' && ($segments[2] ?? '') === 'login-options' && $method === 'POST') {
+        webauthnRequireAvailable();
+        $db     = getDb();
+        $server = webauthnServer($db);
+
+        // Empty allow-list = discoverable-credential ("usernameless") flow: the
+        // browser lets the user pick from passkeys it has stored for this site,
+        // no username needs to be typed first.
+        $options = $server->generatePublicKeyCredentialRequestOptions(
+            \Webauthn\PublicKeyCredentialRequestOptions::USER_VERIFICATION_REQUIREMENT_PREFERRED,
+            []
+        );
+        $_SESSION['webauthn_login_options'] = $options;
+        jsonResponse(json_decode(json_encode($options), true));
+    }
+
+    if ($action === 'passkey' && ($segments[2] ?? '') === 'login' && $method === 'POST') {
+        webauthnRequireAvailable();
+        if (empty($_SESSION['webauthn_login_options'])) jsonResponse(['error' => 'No login in progress'], 400);
+
+        $db     = getDb();
+        $server = webauthnServer($db);
+        $body   = input();
+
+        try {
+            $source = $server->loadAndCheckAssertionResponse(
+                json_encode($body),
+                $_SESSION['webauthn_login_options'],
+                null,
+                webauthnPsrRequest()
+            );
+        } catch (\Throwable $e) {
+            jsonResponse(['error' => 'Passkey sign-in failed'], 401);
+        }
+        unset($_SESSION['webauthn_login_options']);
+
+        $db->prepare('UPDATE webauthn_credentials SET last_used_at = datetime(\'now\') WHERE credential_id = ?')
+           ->execute([base64_encode($source->publicKeyCredentialId)]);
+        $_SESSION['user_id'] = (int)$source->userHandle;
         jsonResponse(['ok' => true]);
     }
 

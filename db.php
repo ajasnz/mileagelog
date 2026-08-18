@@ -104,8 +104,20 @@ function initSchema(PDO $db): void {
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS webauthn_credentials (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       INTEGER NOT NULL,
+            credential_id TEXT    NOT NULL UNIQUE, -- base64url, used as lookup key
+            source_json   TEXT    NOT NULL,        -- serialized Webauthn\PublicKeyCredentialSource
+            label         TEXT,
+            created_at    TEXT DEFAULT (datetime('now')),
+            last_used_at  TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_trips_user_date ON trips(user_id, date);
         CREATE INDEX IF NOT EXISTS idx_trips_vehicle   ON trips(vehicle_id);
+        CREATE INDEX IF NOT EXISTS idx_webauthn_user    ON webauthn_credentials(user_id);
     ");
 
     // ── Incremental column migrations (safe to run on existing DBs) ──────────

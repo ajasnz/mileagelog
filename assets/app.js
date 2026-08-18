@@ -343,6 +343,7 @@ function renderAuth(tab = 'login') {
           <p id="auth-err" class="text-sm" style="color:var(--red);margin-bottom:12px;display:none"></p>
           <button type="submit" class="btn btn-primary btn-full" id="auth-btn">Sign In</button>
         </form>
+        ${'credentials' in navigator ? `<button type="button" class="btn btn-secondary btn-full mt-8" onclick="loginWithPasskey()">🔑 Sign in with a passkey</button>` : ''}
         ` : `
         <form onsubmit="doRegister(event)">
           <div class="field"><label>Username</label><input name="username" type="text" autocomplete="username" required autofocus minlength="2"></div>
@@ -430,6 +431,128 @@ async function doRegister(e) {
     el.textContent = err.message; el.style.display = '';
     btn.textContent = 'Create Account';
   }
+}
+
+// ── Passkeys (WebAuthn) ─────────────────────────────────────────────────────────
+// NOTE: the exact JSON shape the PHP side sends/expects (base64url-encoded
+// challenge/id fields) depends on web-auth/webauthn-lib's serialization,
+// which could not be verified end-to-end in the environment this was written
+// in (no working Composer there). Treat this pairing with webauthn.php/api.php
+// as needing a real end-to-end check once composer install has actually run.
+function b64urlToBuf(b64url) {
+  const b64  = b64url.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(b64url.length / 4) * 4, '=');
+  const bin  = atob(b64);
+  const buf  = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+function bufToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function registerPasskey() {
+  if (!('credentials' in navigator)) { toast('Passkeys aren\'t supported in this browser', 'error'); return; }
+  try {
+    const options   = await api('POST', 'auth/passkey/register-options');
+    const publicKey = {
+      ...options,
+      challenge: b64urlToBuf(options.challenge),
+      user: { ...options.user, id: b64urlToBuf(options.user.id) },
+      excludeCredentials: (options.excludeCredentials || []).map(c => ({ ...c, id: b64urlToBuf(c.id) })),
+    };
+    const cred = await navigator.credentials.create({ publicKey });
+    const credentialJson = {
+      id: cred.id,
+      rawId: bufToB64url(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+        attestationObject: bufToB64url(cred.response.attestationObject),
+      },
+    };
+    const label = prompt('Name this passkey (e.g. "iPhone", "YubiKey")', 'Passkey') || 'Passkey';
+    await api('POST', 'auth/passkey/register', { credential: credentialJson, label });
+    toast('Passkey added');
+    await refreshPasskeyList();
+  } catch (e) {
+    if (e?.name === 'NotAllowedError') return; // user cancelled the OS prompt
+    toast(e.message || 'Could not add passkey', 'error');
+  }
+}
+
+async function loginWithPasskey() {
+  if (!('credentials' in navigator)) { toast('Passkeys aren\'t supported in this browser', 'error'); return; }
+  try {
+    const options   = await api('POST', 'auth/passkey/login-options');
+    const publicKey = {
+      ...options,
+      challenge: b64urlToBuf(options.challenge),
+      allowCredentials: (options.allowCredentials || []).map(c => ({ ...c, id: b64urlToBuf(c.id) })),
+    };
+    const cred = await navigator.credentials.get({ publicKey });
+    const assertionJson = {
+      id: cred.id,
+      rawId: bufToB64url(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+        authenticatorData: bufToB64url(cred.response.authenticatorData),
+        signature: bufToB64url(cred.response.signature),
+        userHandle: cred.response.userHandle ? bufToB64url(cred.response.userHandle) : null,
+      },
+    };
+    await api('POST', 'auth/passkey/login', assertionJson);
+    const { user } = await api('GET', 'auth/me');
+    state.user = user;
+    await loadVehicles(); await loadDashboardData(); await loadReport();
+    renderApp();
+  } catch (e) {
+    if (e?.name === 'NotAllowedError') return; // user cancelled
+    toast(e.message || 'Passkey sign-in failed', 'error');
+  }
+}
+
+async function openPasskeyManager() {
+  closeModal('user-modal');
+  let list = [];
+  try { list = await api('GET', 'auth/passkey'); } catch (_) {}
+  const el = document.createElement('div');
+  el.id = 'passkey-modal'; el.className = 'modal-backdrop';
+  el.innerHTML = `
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-title">Passkeys</div>
+      <p class="text-sm text-muted" style="margin-bottom:16px">Sign in with your device's fingerprint, face, or security key instead of a password.</p>
+      <div id="passkey-list">${renderPasskeyList(list)}</div>
+      <button class="btn btn-secondary btn-full mt-8" onclick="registerPasskey()">+ Add a Passkey</button>
+    </div>
+  `;
+  showModalEl(el);
+}
+function renderPasskeyList(list) {
+  if (!list.length) return `<p class="text-sm text-muted">No passkeys added yet.</p>`;
+  return list.map(p => `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <div style="flex:1">
+        <div style="font-weight:600">${escHtml(p.label || 'Passkey')}</div>
+        <div class="text-sm text-muted">Added ${fmtDate((p.created_at || '').slice(0, 10))}</div>
+      </div>
+      <button class="btn btn-icon btn-danger" onclick="deletePasskey(${p.id})" title="Remove" aria-label="Remove passkey">${iconTrash()}</button>
+    </div>
+  `).join('');
+}
+async function refreshPasskeyList() {
+  const c = document.getElementById('passkey-list');
+  if (!c) return;
+  try { c.innerHTML = renderPasskeyList(await api('GET', 'auth/passkey')); } catch (_) {}
+}
+async function deletePasskey(id) {
+  if (!confirm('Remove this passkey?')) return;
+  try { await api('DELETE', `auth/passkey/${id}`); await refreshPasskeyList(); toast('Passkey removed'); }
+  catch (e) { toast(e.message, 'error'); }
 }
 
 async function doLogout() {
@@ -1846,6 +1969,7 @@ function showUserMenu() {
       ${state.user?.is_admin ? `<button class="btn btn-secondary btn-full" style="margin-bottom:8px" onclick="closeModal('user-modal');navigate('admin')">${iconShield()} Admin Panel</button>` : ''}
       <button class="btn btn-secondary btn-full" style="margin-bottom:8px" onclick="showInSettings()">⚡ Invoice Ninja</button>
       <button class="btn btn-secondary btn-full" style="margin-bottom:8px" onclick="state.user.totp_enabled ? openTotpDisable() : openTotpSetup()">${iconShield()} Two-Factor Auth ${state.user?.totp_enabled ? '<span class="badge badge-business" style="font-size:.65rem">On</span>' : '<span class="text-muted text-sm">(off)</span>'}</button>
+      <button class="btn btn-secondary btn-full" style="margin-bottom:8px" onclick="openPasskeyManager()">🔑 Passkeys</button>
       <button class="btn btn-danger btn-full" onclick="doLogout()">${iconLogout()} Sign Out</button>
     </div>
   `;
