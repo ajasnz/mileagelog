@@ -1,4 +1,4 @@
-const CACHE = 'mileagelog-v8';
+const CACHE = 'mileagelog-v9';
 const STATIC = [
   './',
   './assets/styles.css',
@@ -17,6 +17,20 @@ self.addEventListener('activate', e => {
     caches.keys().then(keys =>
       Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
     ).then(() => self.clients.claim())
+  );
+});
+
+// "Finish Trip" action (or tapping the notification body) on the
+// trip-in-progress notification — route straight into the End Trip form.
+self.addEventListener('notificationclick', e => {
+  const tripId = e.notification.data?.tripId;
+  e.notification.close();
+  const url = self.registration.scope + '?shortcut=end-trip' + (tripId ? `&tripId=${tripId}` : '');
+  e.waitUntil(
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+      for (const c of list) { if ('navigate' in c) return c.navigate(url).then(cl => cl.focus()); }
+      return clients.openWindow(url);
+    })
   );
 });
 

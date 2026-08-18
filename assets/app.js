@@ -203,6 +203,36 @@ async function init() {
   }
 }
 
+// ── "Trip in progress" notification (one-tap Finish) ──────────────────────────
+// Local notification only — no push/server round-trip needed since it's shown
+// the moment the trip starts and cleared the moment it ends.
+async function notifyTripStarted(trip) {
+  if (!('serviceWorker' in navigator) || !('Notification' in window)) return;
+  try {
+    if (Notification.permission === 'default') await Notification.requestPermission();
+    if (Notification.permission !== 'granted') return;
+    const reg     = await navigator.serviceWorker.ready;
+    const vehicle = state.vehicles.find(v => v.id === trip.vehicle_id);
+    const time    = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    await reg.showNotification('Trip in progress', {
+      body: `${vehicle?.name || 'Vehicle'} — started ${time}`,
+      tag: `trip-${trip.id}`,
+      requireInteraction: true,
+      icon: 'icon-192.php',
+      badge: 'icon-192.php',
+      data: { tripId: trip.id },
+      actions: [{ action: 'finish-trip', title: 'Finish Trip' }],
+    });
+  } catch (_) {}
+}
+async function clearTripNotification(tripId) {
+  if (!('serviceWorker' in navigator)) return;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    (await reg.getNotifications({ tag: `trip-${tripId}` })).forEach(n => n.close());
+  } catch (_) {}
+}
+
 // ── Home-screen shortcuts (long-press the app icon) ───────────────────────────
 // Launched right before/after driving — minimize taps and typing. When the
 // vehicle is unambiguous (exactly one) and nothing's already in progress,
@@ -231,6 +261,7 @@ async function quickStartTrip() {
     await loadTrips();
     if (state.page === 'dashboard') await loadDashboardData();
     renderApp();
+    notifyTripStarted(trip);
 
     if ('geolocation' in navigator) {
       navigator.geolocation.getCurrentPosition(async pos => {
@@ -247,13 +278,16 @@ async function quickStartTrip() {
 }
 
 function handleShortcut() {
-  const shortcut = new URLSearchParams(location.search).get('shortcut');
+  const params   = new URLSearchParams(location.search);
+  const shortcut = params.get('shortcut');
   if (!shortcut) return;
+  const tripId = params.get('tripId');
   history.replaceState(history.state, '', location.pathname);
 
   if (shortcut === 'start-trip') {
     quickStartTrip();
   } else if (shortcut === 'end-trip') {
+    if (tripId) { openEndTrip(parseInt(tripId)); return; }
     const pending = state.trips.filter(t => t.status === 'pending');
     if (pending.length === 1) {
       openEndTrip(pending[0].id);
@@ -964,6 +998,7 @@ async function deleteTrip(id) {
     toast('Trip deleted');
     await loadTrips();
     renderApp();
+    clearTripNotification(id);
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -1033,13 +1068,14 @@ async function saveStartTrip(e) {
     status:         'pending',
   };
   try {
-    await api('POST', 'trips', body);
+    const trip = await api('POST', 'trips', body);
     state.lastVehicleId = body.vehicle_id;
     closeModal('start-trip-modal');
     toast('Trip started — end it when you\'re back');
     await loadTrips();
     if (state.page === 'dashboard') await loadDashboardData();
     renderApp();
+    notifyTripStarted(trip);
   } catch (err) {
     toast(err.message, 'error');
     btn.textContent = 'Start Trip';
@@ -1121,6 +1157,7 @@ async function saveEndTrip(e, id) {
     await loadTrips();
     if (state.page === 'dashboard') await loadDashboardData();
     renderApp();
+    clearTripNotification(id);
   } catch (err) {
     toast(err.message, 'error');
     btn.textContent = 'Finish Trip';
