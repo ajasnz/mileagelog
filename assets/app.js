@@ -336,6 +336,7 @@ function renderBottomNav() {
     <nav class="bottomnav">
       <button class="nav-item ${p==='dashboard'?'active':''}" onclick="navigate('dashboard')">${iconHome()}<span>Home</span></button>
       <button class="nav-item ${p==='trips'?'active':''}" onclick="navigate('trips')">${iconList()}<span>Trips</span></button>
+      <button class="nav-item nav-item-compact" onclick="openStartTrip()" title="Start Trip" aria-label="Start Trip">${iconClock()}</button>
       <div class="nav-fab">
         <button class="nav-fab-btn" onclick="openAddTrip()" aria-label="Add trip">${iconPlus()}</button>
         <span>Log Trip</span>
@@ -553,8 +554,6 @@ function renderTrips() {
   return `
     <div class="topbar">
       <span class="topbar-title">Trip Log</span>
-      <button class="btn btn-icon" style="color:white" onclick="openStartTrip()" title="Start Trip" aria-label="Start Trip">${iconClock()}</button>
-      <button class="btn btn-icon" style="color:white" onclick="openAddTrip()" title="Add" aria-label="Add trip">${iconPlus()}</button>
     </div>
     <div class="filter-bar">
       <button class="filter-chip ${!f.trip_type?'active':''}" onclick="setTripFilter('trip_type','')">All</button>
