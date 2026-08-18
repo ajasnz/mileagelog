@@ -1,4 +1,4 @@
-const CACHE = 'mileagelog-v4';
+const CACHE = 'mileagelog-v5';
 const STATIC = [
   './',
   './assets/styles.css',
