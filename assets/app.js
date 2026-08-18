@@ -186,7 +186,7 @@ async function init() {
       // Hydrate instantly from on-device cache so the UI isn't blank while we fetch
       const cv = cacheGet('vehicles'), ct = cacheGet('trips_default'), cd = cacheGet('dash'), cr = cacheGet('report_default');
       if (cv) state.vehicles = cv;
-      if (ct) state.trips = ct;
+      if (ct) { state.trips = ct; tripsLoaded = true; }
       if (cd) dashData = cd;
       if (cr) reportData = cr;
       if (cv || cd) renderApp();
@@ -232,6 +232,7 @@ async function loadVehicles() {
     cacheSet('vehicles', state.vehicles);
   } catch (_) { if (!state.vehicles.length) state.vehicles = []; }
 }
+let tripsLoaded = false;
 async function loadTrips() {
   const isDefault = !state.filters.vehicle_id && !state.filters.from && !state.filters.to && !state.filters.trip_type;
   const p = new URLSearchParams({ limit: 100, ...state.filters });
@@ -239,6 +240,7 @@ async function loadTrips() {
     state.trips = await api('GET', 'trips?' + p);
     if (isDefault) cacheSet('trips_default', state.trips);
   } catch (_) { if (!state.trips.length) state.trips = []; }
+  tripsLoaded = true;
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
@@ -361,10 +363,64 @@ async function navigate(page, fromHistory = false) {
 // closes the modal instead of exiting the PWA. Closing a modal via the UI pops
 // that same entry so the stack stays balanced.
 let modalClosingViaHistory = false;
+let modalOpenerEl = null;
+
+function serializeForm(form) {
+  const data = {};
+  Array.from(form.elements).forEach(elm => {
+    if (!elm.name) return;
+    data[elm.name] = elm.type === 'checkbox' ? elm.checked : elm.value;
+  });
+  return data;
+}
+
+function isModalDirty(el) {
+  const form = el.querySelector('form');
+  if (!form || el.dataset.dirtySnapshot === undefined) return false;
+  return JSON.stringify(serializeForm(form)) !== el.dataset.dirtySnapshot;
+}
+
+// Backdrop click / Escape both route through here so unsaved form edits
+// aren't silently discarded by a stray tap outside the modal.
+function attemptCloseModal(id) {
+  const el = document.getElementById(id);
+  if (el && isModalDirty(el) && !confirm('Discard unsaved changes?')) return;
+  closeModal(id);
+}
+
+function getFocusable(el) {
+  return Array.from(el.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'))
+    .filter(e => !e.disabled && e.offsetParent !== null);
+}
+function trapModalFocus(e, el) {
+  if (e.key !== 'Tab') return;
+  const f = getFocusable(el);
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
 
 function showModalEl(el) {
+  modalOpenerEl = document.activeElement;
   document.body.appendChild(el);
-  requestAnimationFrame(() => el.classList.add('open'));
+
+  const dialog = el.querySelector('.modal');
+  if (dialog) { dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true'); }
+
+  const form = el.querySelector('form');
+  el.dataset.dirtySnapshot = form ? JSON.stringify(serializeForm(form)) : '';
+
+  el.addEventListener('click', e => { if (e.target === el) attemptCloseModal(el.id); });
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { e.preventDefault(); attemptCloseModal(el.id); }
+    else { trapModalFocus(e, el); }
+  });
+
+  requestAnimationFrame(() => {
+    el.classList.add('open');
+    getFocusable(el)[0]?.focus();
+  });
   history.pushState({ modal: true, page: state.page }, '');
 }
 
@@ -377,6 +433,8 @@ function closeModal(id, fromHistory = false) {
     modalClosingViaHistory = true;
     history.back();
   }
+  if (modalOpenerEl?.focus) modalOpenerEl.focus();
+  modalOpenerEl = null;
 }
 
 let historyInitDone = false;
@@ -411,8 +469,8 @@ function renderDashboard() {
   return `
     <div class="topbar">
       <span class="topbar-title">MileageLog</span>
-      ${state.user?.is_admin ? `<button class="btn btn-icon" style="color:white" onclick="navigate('admin')" title="Admin">${iconShield()}</button>` : ''}
-      <button class="btn btn-icon" style="color:white" onclick="showUserMenu()" title="Account">${iconUser()}</button>
+      ${state.user?.is_admin ? `<button class="btn btn-icon" style="color:white" onclick="navigate('admin')" title="Admin" aria-label="Admin">${iconShield()}</button>` : ''}
+      <button class="btn btn-icon" style="color:white" onclick="showUserMenu()" title="Account" aria-label="Account menu">${iconUser()}</button>
     </div>
     <div class="page" id="dash-page">
       ${d ? `
@@ -423,7 +481,7 @@ function renderDashboard() {
         <div class="stat-card"><div class="stat-label">Business use</div><div class="stat-value">${d.business_pct}<span class="stat-unit">%</span></div></div>
         <div class="stat-card" style="background:#f0fdf4"><div class="stat-label">Est. deduction</div><div class="stat-value" style="font-size:1.3rem;color:var(--green)">${fmtCur(d.total_deduction)}</div></div>
       </div>
-      ` : `<div class="card" style="text-align:center;padding:32px"><p class="text-muted">Loading…</p></div>`}
+      ` : skeletonStatsGrid()}
 
       ${state.vehicles.length > 0 ? `
       <button class="btn btn-secondary btn-full mt-8" style="margin-bottom:12px" onclick="openStartTrip()">${iconClock()} Start Trip</button>
@@ -442,16 +500,23 @@ function renderDashboard() {
         <span class="section-title">Recent Trips</span>
         <button class="btn btn-sm btn-secondary" onclick="navigate('trips')">View all</button>
       </div>
-      ${d?.recent?.length > 0 ? d.recent.map(tripCard).join('') : `
+      ${!d ? skeletonTripList(3) : (d.recent?.length > 0 ? d.recent.map(tripCard).join('') : `
         <div class="empty-state" style="padding:32px 0">
           ${iconList()}
           <h3>No trips yet</h3>
           <p>Tap + to log your first trip.</p>
-        </div>`}
+        </div>`)}
 
       <div style="height:8px"></div>
     </div>
   `;
+}
+
+function skeletonStatsGrid() {
+  return `<div class="stats-grid">${Array(4).fill('<div class="stat-card skeleton" style="height:64px"></div>').join('')}</div>`;
+}
+function skeletonTripList(n = 4) {
+  return Array(n).fill('<div class="skeleton skeleton-card"></div>').join('');
 }
 
 function tripCard(t) {
@@ -488,8 +553,8 @@ function renderTrips() {
   return `
     <div class="topbar">
       <span class="topbar-title">Trip Log</span>
-      <button class="btn btn-icon" style="color:white" onclick="openStartTrip()" title="Start Trip">${iconClock()}</button>
-      <button class="btn btn-icon" style="color:white" onclick="openAddTrip()" title="Add">${iconPlus()}</button>
+      <button class="btn btn-icon" style="color:white" onclick="openStartTrip()" title="Start Trip" aria-label="Start Trip">${iconClock()}</button>
+      <button class="btn btn-icon" style="color:white" onclick="openAddTrip()" title="Add" aria-label="Add trip">${iconPlus()}</button>
     </div>
     <div class="filter-bar">
       <button class="filter-chip ${!f.trip_type?'active':''}" onclick="setTripFilter('trip_type','')">All</button>
@@ -498,7 +563,7 @@ function renderTrips() {
       ${state.vehicles.map(v => `<button class="filter-chip ${f.vehicle_id==v.id?'active':''}" onclick="setTripFilter('vehicle_id','${v.id}')">${escHtml(v.name)}</button>`).join('')}
     </div>
     <div class="page" style="padding-top:12px">
-      ${state.trips.length === 0 ? `<div class="empty-state">${iconList()}<h3>No trips found</h3><p>Tap + to log a new trip.</p></div>` : state.trips.map(tripCard).join('')}
+      ${!tripsLoaded ? skeletonTripList(5) : (state.trips.length === 0 ? `<div class="empty-state">${iconList()}<h3>No trips found</h3><p>Tap + to log a new trip.</p></div>` : state.trips.map(tripCard).join(''))}
     </div>
   `;
 }
@@ -635,7 +700,6 @@ function showTripModal(id, data = {}) {
       </form>
     </div>
   `;
-  el.addEventListener('click', e => { if (e.target === el) closeModal('trip-modal'); });
   showModalEl(el);
   state.tripLegs = [];
 
@@ -763,20 +827,20 @@ function renderLegs() {
 
   if (isReturn) {
     const half = !isNaN(total) ? (total / 2).toFixed(1) : '—';
-    c.innerHTML = `<p class="text-sm text-muted mt-8">Leg 1: ${escHtml(from)} → ${escHtml(to)} (${half} km) · Leg 2 (auto): ${escHtml(to)} → ${escHtml(from)} (${half} km)</p>`;
+    c.innerHTML = `<p class="leg-preview mt-8">Leg 1: ${escHtml(from)} → ${escHtml(to)} (${half} km) · Leg 2 (auto): ${escHtml(to)} → ${escHtml(from)} (${half} km)</p>`;
     return;
   }
   c.innerHTML = state.tripLegs.map((leg, i) => `
-    <div class="mt-8" style="display:flex;gap:8px;align-items:flex-end">
-      <div class="field" style="flex:1;margin-bottom:0">
+    <div class="leg-row mt-8">
+      <div class="field leg-row-location">
         <label class="text-sm">Leg ${i+2} — To</label>
         <input type="text" value="${escAttr(leg.end_location)}" placeholder="Next destination" oninput="updateLeg(${i},'end_location',this.value)">
       </div>
-      <div class="field" style="flex:0 0 90px;margin-bottom:0">
+      <div class="field leg-row-distance">
         <label class="text-sm">Distance</label>
         <input type="number" step="0.1" min="0.1" value="${escAttr(leg.distance)}" placeholder="km" oninput="updateLeg(${i},'distance',this.value)">
       </div>
-      <button type="button" class="btn btn-icon btn-danger" onclick="removeLeg(${i})" title="Remove leg">✕</button>
+      <button type="button" class="btn btn-icon btn-danger" onclick="removeLeg(${i})" title="Remove leg" aria-label="Remove leg ${i+2}">✕</button>
     </div>
   `).join('');
 }
@@ -906,7 +970,6 @@ function openStartTrip() {
       </form>
     </div>
   `;
-  el.addEventListener('click', e => { if (e.target === el) closeModal('start-trip-modal'); });
   showModalEl(el);
 
   detectLocation('start-trip-location');
@@ -979,7 +1042,6 @@ async function openEndTrip(id) {
       </form>
     </div>
   `;
-  el.addEventListener('click', e => { if (e.target === el) closeModal('end-trip-modal'); });
   showModalEl(el);
   detectLocation('end-trip-location');
 }
@@ -1029,7 +1091,7 @@ function renderVehicles() {
   return `
     <div class="topbar">
       <span class="topbar-title">My Vehicles</span>
-      <button class="btn btn-icon" style="color:white" onclick="openAddVehicle()">${iconPlus()}</button>
+      <button class="btn btn-icon" style="color:white" onclick="openAddVehicle()" title="Add vehicle" aria-label="Add vehicle">${iconPlus()}</button>
     </div>
     <div class="page">
       ${state.vehicles.length === 0
@@ -1093,7 +1155,6 @@ function showVehicleModal(id, data = {}) {
       </form>
     </div>
   `;
-  el.addEventListener('click', e => { if (e.target === el) closeModal('vehicle-modal'); });
   showModalEl(el);
 }
 
@@ -1147,7 +1208,7 @@ function renderReports() {
   return `
     <div class="topbar">
       <span class="topbar-title">Reports</span>
-      ${d ? `<button class="btn btn-icon" style="color:white" onclick="exportCsv()" title="Export">${iconDownload()}</button>` : ''}
+      ${d ? `<button class="btn btn-icon" style="color:white" onclick="exportCsv()" title="Export" aria-label="Export CSV">${iconDownload()}</button>` : ''}
     </div>
     <div class="page">
       <div class="card">
@@ -1165,7 +1226,7 @@ function renderReports() {
         </div>` : ''}
       </div>
 
-      ${!d ? `<div class="card" style="text-align:center;padding:32px"><p class="text-muted">Loading…</p></div>` : `
+      ${!d ? `<div class="card"><div class="skeleton skeleton-line" style="width:60%"></div>${skeletonStatsGrid()}</div>` : `
 
       <div class="card">
         <div class="card-title">IRD Logbook Summary</div>
@@ -1439,7 +1500,6 @@ function openRateModal(id) {
       </form>
     </div>
   `;
-  el.addEventListener('click', e => { if (e.target === el) closeModal('rate-modal'); });
   document.getElementById('rate-modal')?.remove();
   showModalEl(el);
 }
@@ -1512,7 +1572,6 @@ async function showInSettings() {
       </form>
     </div>
   `;
-  el.addEventListener('click', e => { if (e.target === el) closeModal('in-settings-modal'); });
   showModalEl(el);
 }
 
@@ -1614,7 +1673,6 @@ async function openInExpenseModal(tripId) {
       </form>
     </div>
   `;
-  el.addEventListener('click', e => { if (e.target === el) closeModal('in-expense-modal'); });
   document.getElementById('in-expense-modal')?.remove();
   showModalEl(el);
 }
@@ -1672,7 +1730,6 @@ function showUserMenu() {
       <button class="btn btn-danger btn-full" onclick="doLogout()">${iconLogout()} Sign Out</button>
     </div>
   `;
-  el.addEventListener('click', e => { if (e.target === el) closeModal('user-modal'); });
   showModalEl(el);
 }
 

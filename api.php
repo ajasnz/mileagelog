@@ -31,10 +31,12 @@ header('Content-Type: application/json');
 header('X-Content-Type-Options: nosniff');
 
 set_exception_handler(function (Throwable $e) {
+    error_log('[mileageLog] ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
     ob_clean();
     http_response_code(500);
     header('Content-Type: application/json');
-    echo json_encode(['error' => $e->getMessage()]);
+    // Don't leak internal exception messages (file paths, SQL, etc.) to the client.
+    echo json_encode(['error' => 'Something went wrong. Please try again.']);
     exit;
 });
 
@@ -44,6 +46,23 @@ function jsonResponse(mixed $data, int $code = 200): never {
     http_response_code($code);
     echo json_encode($data);
     exit;
+}
+
+// Shared sanity checks for the single-trip POST/PUT payload. Kept separate
+// from the group/leg endpoint, which derives odometers by chaining and so
+// can't produce an inconsistent start/end pair on its own.
+function validateTripDistanceAndOdo(array $d, string $status): void {
+    if ($status !== 'pending') {
+        $distance = isset($d['distance']) ? (float)$d['distance'] : 0;
+        if ($distance <= 0) {
+            jsonResponse(['error' => 'Distance must be greater than 0'], 422);
+        }
+    }
+    if (isset($d['start_odometer']) && isset($d['end_odometer']) && $d['start_odometer'] !== null && $d['end_odometer'] !== null) {
+        if ((float)$d['end_odometer'] < (float)$d['start_odometer']) {
+            jsonResponse(['error' => 'End odometer must be greater than or equal to start odometer'], 422);
+        }
+    }
 }
 
 function requireAuth(): int {
@@ -471,28 +490,35 @@ if ($resource === 'trips') {
         $prevOdo      = isset($d['start_odometer']) ? (float)$d['start_odometer'] : null;
         $created      = [];
 
-        foreach ($legs as $i => $leg) {
-            $distance = (float)$leg['distance'];
-            $endLoc   = $leg['end_location'] ?? null;
-            $endOdo   = $prevOdo !== null ? $prevOdo + $distance : null;
+        $db->beginTransaction();
+        try {
+            foreach ($legs as $i => $leg) {
+                $distance = (float)$leg['distance'];
+                $endLoc   = $leg['end_location'] ?? null;
+                $endOdo   = $prevOdo !== null ? $prevOdo + $distance : null;
 
-            $stmt->execute([
-                (int)$d['vehicle_id'], $uid,
-                $d['date'],
-                $prevOdo, $endOdo, $distance,
-                $d['purpose'] ?? '',
-                $tripType,
-                $d['client_name'] ?? null,
-                !empty($d['billable']) ? 1 : 0,
-                $prevLocation, $endLoc,
-                $d['notes'] ?? null,
-                'completed',
-                $groupId, $i + 1,
-                !empty($leg['is_return']) ? 1 : 0,
-            ]);
-            $created[] = (int)$db->lastInsertId();
-            $prevLocation = $endLoc;
-            $prevOdo      = $endOdo;
+                $stmt->execute([
+                    (int)$d['vehicle_id'], $uid,
+                    $d['date'],
+                    $prevOdo, $endOdo, $distance,
+                    $d['purpose'] ?? '',
+                    $tripType,
+                    $d['client_name'] ?? null,
+                    !empty($d['billable']) ? 1 : 0,
+                    $prevLocation, $endLoc,
+                    $d['notes'] ?? null,
+                    'completed',
+                    $groupId, $i + 1,
+                    !empty($leg['is_return']) ? 1 : 0,
+                ]);
+                $created[] = (int)$db->lastInsertId();
+                $prevLocation = $endLoc;
+                $prevOdo      = $endOdo;
+            }
+            $db->commit();
+        } catch (Throwable $e) {
+            $db->rollBack();
+            throw $e;
         }
 
         $placeholders = implode(',', array_fill(0, count($created), '?'));
@@ -540,6 +566,7 @@ if ($resource === 'trips') {
         if ($tripType === 'business' && $status === 'completed' && empty($d['purpose'])) {
             jsonResponse(['error' => 'Purpose is required for business trips'], 422);
         }
+        validateTripDistanceAndOdo($d, $status);
         $chk = $db->prepare('SELECT id FROM vehicles WHERE id=? AND user_id=?');
         $chk->execute([(int)$d['vehicle_id'], $uid]);
         if (!$chk->fetch()) jsonResponse(['error' => 'Vehicle not found'], 404);
@@ -574,6 +601,7 @@ if ($resource === 'trips') {
         if (!$chk->fetch()) jsonResponse(['error' => 'Not found'], 404);
         $tripType = in_array($d['trip_type'] ?? 'business', ['business','private']) ? $d['trip_type'] : 'business';
         $status   = in_array($d['status'] ?? 'completed', ['pending','completed']) ? $d['status'] : 'completed';
+        validateTripDistanceAndOdo($d, $status);
         $db->prepare("UPDATE trips SET date=?, start_odometer=?, end_odometer=?, distance=?, purpose=?, trip_type=?, client_name=?, billable=?, start_location=?, end_location=?, notes=?, status=?, updated_at=datetime('now') WHERE id=? AND user_id=?")
            ->execute([
                $d['date'],
