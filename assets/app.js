@@ -204,13 +204,55 @@ async function init() {
 }
 
 // ── Home-screen shortcuts (long-press the app icon) ───────────────────────────
+// Launched right before/after driving — minimize taps and typing. When the
+// vehicle is unambiguous (exactly one) and nothing's already in progress,
+// skip the form entirely: create the pending trip immediately and fill in
+// the location in the background once geolocation resolves.
+async function quickStartTrip() {
+  if (state.vehicles.length === 0) { toast('Add a vehicle first', 'error'); navigate('vehicles'); return; }
+  if (state.trips.some(t => t.status === 'pending')) {
+    toast('You already have a trip in progress', 'error');
+    navigate('trips');
+    return;
+  }
+  if (state.vehicles.length > 1) { openStartTrip(); return; } // ambiguous — ask which vehicle
+
+  try {
+    const trip = await api('POST', 'trips', {
+      vehicle_id: state.vehicles[0].id,
+      date: today(),
+      trip_type: 'business',
+      purpose: '',
+      distance: 0,
+      status: 'pending',
+    });
+    state.lastVehicleId = trip.vehicle_id;
+    toast('Trip started — end it when you\'re back');
+    await loadTrips();
+    if (state.page === 'dashboard') await loadDashboardData();
+    renderApp();
+
+    if ('geolocation' in navigator) {
+      navigator.geolocation.getCurrentPosition(async pos => {
+        const addr = await reverseGeocode(pos.coords.latitude, pos.coords.longitude);
+        if (!addr) return;
+        try {
+          await api('PUT', `trips/${trip.id}`, { ...trip, start_location: addr });
+          await loadTrips();
+          if (state.page === 'trips') renderApp();
+        } catch (_) {}
+      }, () => {}, { timeout: 10000, enableHighAccuracy: false });
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
 function handleShortcut() {
   const shortcut = new URLSearchParams(location.search).get('shortcut');
   if (!shortcut) return;
   history.replaceState(history.state, '', location.pathname);
 
   if (shortcut === 'start-trip') {
-    openStartTrip();
+    quickStartTrip();
   } else if (shortcut === 'end-trip') {
     const pending = state.trips.filter(t => t.status === 'pending');
     if (pending.length === 1) {
