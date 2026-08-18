@@ -609,7 +609,7 @@ function showTripModal(id, data = {}) {
           <input name="distance" type="number" step="0.1" min="0.1" value="${data.distance||''}" required placeholder="e.g. 65.0" id="dist-input" oninput="autoCalcDist()">
         </div>
 
-        ${!isEdit ? `
+        ${!data.trip_group_id ? `
         <div class="field">
           <label class="checkbox-label">
             <input type="checkbox" id="return-trip-cb" onchange="toggleReturnTrip(this.checked)">
@@ -620,9 +620,10 @@ function showTripModal(id, data = {}) {
           <div id="legs-list"></div>
           <button type="button" class="btn btn-sm btn-secondary" id="add-leg-btn" onclick="addLeg()">+ Add another leg</button>
         </div>
-        ` : (data.trip_group_id ? `
+        ${isEdit ? `<p class="text-sm text-muted mt-8">Checking this replaces this single trip with separate linked legs.</p>` : ''}
+        ` : `
         <div class="field text-sm text-muted">${data.is_return_leg ? '↩ Return leg' : 'Leg ' + (data.leg_order||1)} of a multi-leg trip (id ${escHtml(data.trip_group_id)}). Other legs are edited separately.</div>
-        ` : '')}
+        `}
 
         <div class="field">
           <label>Notes <span class="text-muted text-sm">(optional)</span></label>
@@ -653,12 +654,26 @@ function showTripModal(id, data = {}) {
 
 // ── Chip-based suggestions (in-flow, not a native popup — avoids the mobile
 // keyboard-overlay issue that <input list> / <datalist> popups have) ──────────
+const CHIP_VISIBLE_LIMIT = 8;
 function suggestChipsHtml(items, fieldName) {
-  return items.map(p => `<button type="button" class="suggest-chip" onclick="selectChip('${fieldName}','${escAttr(p)}')">${escHtml(p)}</button>`).join('');
+  const visible = items.slice(0, CHIP_VISIBLE_LIMIT);
+  const extra   = items.slice(CHIP_VISIBLE_LIMIT);
+  let html = visible.map(p => `<button type="button" class="suggest-chip" onclick="selectChip('${fieldName}','${escAttr(p)}')">${escHtml(p)}</button>`).join('');
+  if (extra.length) {
+    html += extra.map(p => `<button type="button" class="suggest-chip chip-extra" onclick="selectChip('${fieldName}','${escAttr(p)}')">${escHtml(p)}</button>`).join('');
+    html += `<button type="button" class="suggest-chip chip-more" onclick="expandChips(this)">+${extra.length} more</button>`;
+  }
+  return html;
+}
+function expandChips(btn) {
+  const c = btn.closest('.suggestions');
+  if (c) c.classList.add('chips-expanded');
+  btn.remove();
 }
 function populateChips(containerId, names, fieldName) {
   const c = document.getElementById(containerId);
   if (!c) return;
+  c.classList.remove('chips-expanded');
   c.innerHTML = suggestChipsHtml(names, fieldName);
 }
 function mergeChips(containerId, staticItems, dynamicItems, fieldName) {
@@ -672,7 +687,10 @@ function mergeChips(containerId, staticItems, dynamicItems, fieldName) {
 }
 function filterChips(containerId, val) {
   const lo = val.toLowerCase();
+  const c  = document.getElementById(containerId);
+  if (c) c.classList.toggle('chips-expanded', !!val);
   document.querySelectorAll(`#${containerId} .suggest-chip`).forEach(c => {
+    if (c.classList.contains('chip-more')) { c.style.display = val ? 'none' : ''; return; }
     c.style.display = !val || c.textContent.toLowerCase().includes(lo) ? '' : 'none';
   });
 }
@@ -783,7 +801,7 @@ async function saveTrip(e, id) {
   };
 
   try {
-    if (!id && (isReturn || state.tripLegs.length > 0)) {
+    if (isReturn || state.tripLegs.length > 0) {
       // Multi-leg / return trip: create a chain of linked trip rows.
       let legs;
       if (isReturn) {
@@ -805,6 +823,8 @@ async function saveTrip(e, id) {
         legs,
       };
       await api('POST', 'trips/group', body);
+      // Editing an existing single trip into a group: replace the original row.
+      if (id) await api('DELETE', `trips/${id}`);
       state.tripLegs = [];
     } else {
       const body = {
