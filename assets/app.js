@@ -362,7 +362,8 @@ async function doLogin(e) {
   const f = e.target, btn = document.getElementById('auth-btn');
   btn.innerHTML = '<span class="spinner"></span>';
   try {
-    await api('POST', 'auth/login', { username: f.username.value, password: f.password.value });
+    const res = await api('POST', 'auth/login', { username: f.username.value, password: f.password.value });
+    if (res.totp_required) { renderTotpChallenge(); return; }
     const { user } = await api('GET', 'auth/me');
     state.user = user;
     await loadVehicles(); await loadDashboardData(); await loadReport();
@@ -371,6 +372,45 @@ async function doLogin(e) {
     const el = document.getElementById('auth-err');
     el.textContent = err.message; el.style.display = '';
     btn.textContent = 'Sign In';
+  }
+}
+
+// ── TOTP 2FA login challenge ───────────────────────────────────────────────────
+function renderTotpChallenge() {
+  setHtml(`
+    <div class="auth-screen">
+      <div class="auth-logo">
+        <svg viewBox="0 0 64 64" width="72" height="72"><circle cx="32" cy="32" r="30" fill="rgba(255,255,255,.15)"/><path d="M20 40 L32 16 L44 40 Z" fill="white" opacity=".9"/><rect x="28" y="33" width="8" height="9" rx="1" fill="rgba(0,0,0,.3)"/></svg>
+        <h1>MileageLog</h1>
+      </div>
+      <div class="auth-card">
+        <div class="card-title" style="margin-bottom:8px">Two-factor code</div>
+        <p class="text-sm text-muted" style="margin-bottom:16px">Enter the 6-digit code from your authenticator app, or one of your backup codes.</p>
+        <form onsubmit="doTotpVerify(event)">
+          <div class="field"><input name="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required autofocus></div>
+          <p id="auth-err" class="text-sm" style="color:var(--red);margin-bottom:12px;display:none"></p>
+          <button type="submit" class="btn btn-primary btn-full" id="auth-btn">Verify</button>
+          <button type="button" class="btn btn-secondary btn-full mt-8" onclick="loadAuthStatus().then(renderAuth)">Cancel</button>
+        </form>
+      </div>
+    </div>
+  `);
+}
+
+async function doTotpVerify(e) {
+  e.preventDefault();
+  const f = e.target, btn = document.getElementById('auth-btn');
+  btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await api('POST', 'auth/totp/verify', { code: f.code.value });
+    const { user } = await api('GET', 'auth/me');
+    state.user = user;
+    await loadVehicles(); await loadDashboardData(); await loadReport();
+    renderApp();
+  } catch (err) {
+    const el = document.getElementById('auth-err');
+    el.textContent = err.message; el.style.display = '';
+    btn.textContent = 'Verify';
   }
 }
 
@@ -1805,10 +1845,111 @@ function showUserMenu() {
       </div>
       ${state.user?.is_admin ? `<button class="btn btn-secondary btn-full" style="margin-bottom:8px" onclick="closeModal('user-modal');navigate('admin')">${iconShield()} Admin Panel</button>` : ''}
       <button class="btn btn-secondary btn-full" style="margin-bottom:8px" onclick="showInSettings()">⚡ Invoice Ninja</button>
+      <button class="btn btn-secondary btn-full" style="margin-bottom:8px" onclick="state.user.totp_enabled ? openTotpDisable() : openTotpSetup()">${iconShield()} Two-Factor Auth ${state.user?.totp_enabled ? '<span class="badge badge-business" style="font-size:.65rem">On</span>' : '<span class="text-muted text-sm">(off)</span>'}</button>
       <button class="btn btn-danger btn-full" onclick="doLogout()">${iconLogout()} Sign Out</button>
     </div>
   `;
   showModalEl(el);
+}
+
+// ── Two-factor auth (TOTP) enrollment ──────────────────────────────────────────
+async function openTotpSetup() {
+  let setup;
+  try { setup = await api('POST', 'auth/totp/setup'); } catch (e) { toast(e.message, 'error'); return; }
+
+  closeModal('user-modal');
+  const el = document.createElement('div');
+  el.id = 'totp-setup-modal'; el.className = 'modal-backdrop';
+  el.innerHTML = `
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-title">Set up two-factor auth</div>
+      <p class="text-sm text-muted" style="margin-bottom:12px">Add this key to your authenticator app (Google Authenticator, Authy, 1Password, etc.), then enter the 6-digit code it shows to confirm.</p>
+      <div class="card" style="background:var(--green-lt);text-align:center;margin-bottom:16px">
+        <div class="text-sm text-muted" style="margin-bottom:4px">Secret key</div>
+        <div style="font-family:monospace;font-size:1rem;font-weight:700;letter-spacing:.05em;word-break:break-all">${escHtml(setup.secret)}</div>
+      </div>
+      <form onsubmit="confirmTotpSetup(event)">
+        <div class="field">
+          <label>6-digit code</label>
+          <input name="code" type="text" inputmode="numeric" placeholder="123456" required autofocus>
+        </div>
+        <p id="totp-setup-err" class="text-sm" style="color:var(--red);margin-bottom:12px;display:none"></p>
+        <button type="submit" class="btn btn-primary btn-full" id="totp-setup-btn">Confirm &amp; Enable</button>
+      </form>
+    </div>
+  `;
+  showModalEl(el);
+}
+
+async function confirmTotpSetup(e) {
+  e.preventDefault();
+  const f = e.target, btn = document.getElementById('totp-setup-btn');
+  btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const res = await api('POST', 'auth/totp/confirm', { code: f.code.value });
+    state.user.totp_enabled = true;
+    closeModal('totp-setup-modal');
+    showTotpBackupCodes(res.backup_codes);
+  } catch (err) {
+    const el = document.getElementById('totp-setup-err');
+    el.textContent = err.message; el.style.display = '';
+    btn.textContent = 'Confirm & Enable';
+  }
+}
+
+function showTotpBackupCodes(codes) {
+  const el = document.createElement('div');
+  el.id = 'totp-backup-modal'; el.className = 'modal-backdrop';
+  el.innerHTML = `
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-title">Save your backup codes</div>
+      <p class="text-sm text-muted" style="margin-bottom:12px">Two-factor auth is now on. Each of these single-use codes can sign you in if you lose access to your authenticator app — they're shown once, save them somewhere safe.</p>
+      <div class="card" style="background:var(--green-lt);margin-bottom:16px">
+        <div style="font-family:monospace;font-size:1rem;line-height:1.9;text-align:center">${codes.map(escHtml).join('<br>')}</div>
+      </div>
+      <button class="btn btn-primary btn-full" onclick="closeModal('totp-backup-modal')">I've saved these</button>
+    </div>
+  `;
+  showModalEl(el);
+}
+
+function openTotpDisable() {
+  closeModal('user-modal');
+  const el = document.createElement('div');
+  el.id = 'totp-disable-modal'; el.className = 'modal-backdrop';
+  el.innerHTML = `
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-title">Turn off two-factor auth</div>
+      <form onsubmit="confirmTotpDisable(event)">
+        <div class="field">
+          <label>Confirm your password</label>
+          <input name="password" type="password" autocomplete="current-password" required autofocus>
+        </div>
+        <p id="totp-disable-err" class="text-sm" style="color:var(--red);margin-bottom:12px;display:none"></p>
+        <button type="submit" class="btn btn-danger btn-full" id="totp-disable-btn">Turn Off</button>
+      </form>
+    </div>
+  `;
+  showModalEl(el);
+}
+
+async function confirmTotpDisable(e) {
+  e.preventDefault();
+  const f = e.target, btn = document.getElementById('totp-disable-btn');
+  btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await api('POST', 'auth/totp/disable', { password: f.password.value });
+    state.user.totp_enabled = false;
+    closeModal('totp-disable-modal');
+    toast('Two-factor auth turned off');
+  } catch (err) {
+    const el = document.getElementById('totp-disable-err');
+    el.textContent = err.message; el.style.display = '';
+    btn.textContent = 'Turn Off';
+  }
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

@@ -116,14 +116,113 @@ if ($resource === 'auth') {
     if ($action === 'login' && $method === 'POST') {
         $data = input();
         $db   = getDb();
-        $stmt = $db->prepare('SELECT id, password_hash FROM users WHERE username = ?');
+        $stmt = $db->prepare('SELECT id, password_hash, totp_enabled FROM users WHERE username = ?');
         $stmt->execute([trim($data['username'] ?? '')]);
         $user = $stmt->fetch();
         if ($user && password_verify($data['password'] ?? '', $user['password_hash'])) {
+            if (!empty($user['totp_enabled'])) {
+                // Password is correct but 2FA isn't satisfied yet — hold the login in a
+                // short-lived pending state rather than setting user_id.
+                unset($_SESSION['user_id']);
+                $_SESSION['totp_pending_uid']     = $user['id'];
+                $_SESSION['totp_pending_attempts'] = 0;
+                jsonResponse(['totp_required' => true]);
+            }
             $_SESSION['user_id'] = $user['id'];
             jsonResponse(['ok' => true]);
         }
         jsonResponse(['error' => 'Invalid username or password'], 401);
+    }
+
+    if ($action === 'totp' && ($segments[2] ?? '') === 'verify' && $method === 'POST') {
+        $data = input();
+        if (empty($_SESSION['totp_pending_uid'])) jsonResponse(['error' => 'No login in progress'], 400);
+        if (($_SESSION['totp_pending_attempts'] ?? 0) >= 8) {
+            unset($_SESSION['totp_pending_uid'], $_SESSION['totp_pending_attempts']);
+            jsonResponse(['error' => 'Too many attempts. Please log in again.'], 429);
+        }
+        $db   = getDb();
+        $stmt = $db->prepare('SELECT id, totp_secret, totp_backup_codes FROM users WHERE id = ?');
+        $stmt->execute([$_SESSION['totp_pending_uid']]);
+        $user = $stmt->fetch();
+        if (!$user) jsonResponse(['error' => 'No login in progress'], 400);
+
+        $code = trim((string)($data['code'] ?? ''));
+        $ok   = $user['totp_secret'] && totpVerify($user['totp_secret'], $code);
+
+        // Fall back to a single-use backup code if the TOTP code didn't match.
+        if (!$ok && $user['totp_backup_codes']) {
+            $codes = json_decode($user['totp_backup_codes'], true) ?: [];
+            foreach ($codes as $i => $hash) {
+                if (password_verify(strtolower(str_replace('-', '', $code)), $hash)) {
+                    unset($codes[$i]);
+                    $db->prepare('UPDATE users SET totp_backup_codes = ? WHERE id = ?')
+                       ->execute([json_encode(array_values($codes)), $user['id']]);
+                    $ok = true;
+                    break;
+                }
+            }
+        }
+
+        if (!$ok) {
+            $_SESSION['totp_pending_attempts'] = ($_SESSION['totp_pending_attempts'] ?? 0) + 1;
+            jsonResponse(['error' => 'Invalid code'], 401);
+        }
+        $_SESSION['user_id'] = $user['id'];
+        unset($_SESSION['totp_pending_uid'], $_SESSION['totp_pending_attempts']);
+        jsonResponse(['ok' => true]);
+    }
+
+    // ── TOTP enrollment (must already be logged in) ──────────────────────────
+    if ($action === 'totp' && ($segments[2] ?? '') === 'setup' && $method === 'POST') {
+        $uid  = requireAuth();
+        $db   = getDb();
+        $stmt = $db->prepare('SELECT username FROM users WHERE id = ?');
+        $stmt->execute([$uid]);
+        $username = $stmt->fetchColumn();
+
+        // Store as a pending (not-yet-enabled) secret until confirmed with a valid code.
+        $secret = totpGenerateSecret();
+        $db->prepare('UPDATE users SET totp_secret = ?, totp_enabled = 0, totp_backup_codes = NULL WHERE id = ?')
+           ->execute([$secret, $uid]);
+
+        jsonResponse(['secret' => $secret, 'otpauth_url' => totpOtpAuthUrl($secret, $username)]);
+    }
+
+    if ($action === 'totp' && ($segments[2] ?? '') === 'confirm' && $method === 'POST') {
+        $uid  = requireAuth();
+        $data = input();
+        $db   = getDb();
+        $stmt = $db->prepare('SELECT totp_secret FROM users WHERE id = ?');
+        $stmt->execute([$uid]);
+        $secret = $stmt->fetchColumn();
+        if (!$secret) jsonResponse(['error' => 'Run setup first'], 400);
+        if (!totpVerify($secret, trim((string)($data['code'] ?? '')))) {
+            jsonResponse(['error' => 'Invalid code'], 401);
+        }
+
+        $backupCodes = totpGenerateBackupCodes();
+        $hashed      = array_map(fn($c) => password_hash($c, PASSWORD_DEFAULT), $backupCodes);
+        $db->prepare('UPDATE users SET totp_enabled = 1, totp_backup_codes = ? WHERE id = ?')
+           ->execute([json_encode($hashed), $uid]);
+
+        // Backup codes are shown to the user exactly once, here.
+        jsonResponse(['ok' => true, 'backup_codes' => $backupCodes]);
+    }
+
+    if ($action === 'totp' && ($segments[2] ?? '') === 'disable' && $method === 'POST') {
+        $uid  = requireAuth();
+        $data = input();
+        $db   = getDb();
+        $stmt = $db->prepare('SELECT password_hash FROM users WHERE id = ?');
+        $stmt->execute([$uid]);
+        $hash = $stmt->fetchColumn();
+        if (!$hash || !password_verify($data['password'] ?? '', $hash)) {
+            jsonResponse(['error' => 'Incorrect password'], 401);
+        }
+        $db->prepare('UPDATE users SET totp_secret = NULL, totp_enabled = 0, totp_backup_codes = NULL WHERE id = ?')
+           ->execute([$uid]);
+        jsonResponse(['ok' => true]);
     }
 
     if ($action === 'register' && $method === 'POST') {
@@ -161,10 +260,10 @@ if ($resource === 'auth') {
     if ($action === 'me' && $method === 'GET') {
         if (empty($_SESSION['user_id'])) jsonResponse(['user' => null]);
         $db   = getDb();
-        $stmt = $db->prepare('SELECT id, username, email, is_admin FROM users WHERE id = ?');
+        $stmt = $db->prepare('SELECT id, username, email, is_admin, totp_enabled FROM users WHERE id = ?');
         $stmt->execute([$_SESSION['user_id']]);
         $user = $stmt->fetch();
-        if ($user) $user['is_admin'] = (bool)$user['is_admin'];
+        if ($user) { $user['is_admin'] = (bool)$user['is_admin']; $user['totp_enabled'] = (bool)$user['totp_enabled']; }
         jsonResponse(['user' => $user ?: null]);
     }
 

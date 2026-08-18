@@ -120,6 +120,9 @@ function initSchema(PDO $db): void {
         ['trips',    'trip_group_id',  "ALTER TABLE trips    ADD COLUMN trip_group_id  TEXT"],
         ['trips',    'leg_order',      "ALTER TABLE trips    ADD COLUMN leg_order      INTEGER"],
         ['trips',    'is_return_leg',  "ALTER TABLE trips    ADD COLUMN is_return_leg  INTEGER DEFAULT 0"],
+        ['users',    'totp_secret',       "ALTER TABLE users ADD COLUMN totp_secret       TEXT"],
+        ['users',    'totp_enabled',      "ALTER TABLE users ADD COLUMN totp_enabled      INTEGER DEFAULT 0"],
+        ['users',    'totp_backup_codes', "ALTER TABLE users ADD COLUMN totp_backup_codes TEXT"],
     ];
     foreach ($colMigrations as [$table, $col, $sql]) {
         if (!columnExists($db, $table, $col)) {
@@ -171,4 +174,72 @@ function seedIrdRates(PDO $db): void {
 function nzTaxYear(string $date): int {
     [$y, $m] = explode('-', $date);
     return (int)$m >= 4 ? (int)$y + 1 : (int)$y;
+}
+
+// ── TOTP (RFC 6238 / RFC 4226) — plain HMAC-SHA1, no external dependency ─────
+
+function totpBase32Encode(string $data): string {
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    $bits = '';
+    foreach (str_split($data) as $byte) $bits .= str_pad(decbin(ord($byte)), 8, '0', STR_PAD_LEFT);
+    $out = '';
+    foreach (str_split($bits, 5) as $chunk) $out .= $alphabet[bindec(str_pad($chunk, 5, '0'))];
+    return $out;
+}
+
+function totpBase32Decode(string $b32): string {
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    $b32  = strtoupper(preg_replace('/[^A-Za-z2-7]/', '', $b32));
+    $bits = '';
+    foreach (str_split($b32) as $char) {
+        $val = strpos($alphabet, $char);
+        if ($val === false) continue;
+        $bits .= str_pad(decbin($val), 5, '0', STR_PAD_LEFT);
+    }
+    $bytes = '';
+    foreach (str_split($bits, 8) as $byte) {
+        if (strlen($byte) < 8) continue;
+        $bytes .= chr(bindec($byte));
+    }
+    return $bytes;
+}
+
+function totpGenerateSecret(): string {
+    return totpBase32Encode(random_bytes(20)); // 160-bit secret
+}
+
+function totpCode(string $secretBase32, ?int $timestamp = null, int $period = 30, int $digits = 6): string {
+    $secret = totpBase32Decode($secretBase32);
+    $counter = intdiv($timestamp ?? time(), $period);
+    $counterBin = pack('N', 0) . pack('N', $counter); // 8-byte big-endian counter
+    $hash = hash_hmac('sha1', $counterBin, $secret, true);
+    $offset = ord($hash[19]) & 0x0f;
+    $truncated = ((ord($hash[$offset])   & 0x7f) << 24)
+               | ((ord($hash[$offset+1]) & 0xff) << 16)
+               | ((ord($hash[$offset+2]) & 0xff) << 8)
+               |  (ord($hash[$offset+3]) & 0xff);
+    return str_pad((string)($truncated % (10 ** $digits)), $digits, '0', STR_PAD_LEFT);
+}
+
+/** Accepts a code from the current 30s window or one step either side, to tolerate clock drift. */
+function totpVerify(string $secretBase32, string $code, int $window = 1): bool {
+    $code = preg_replace('/\s+/', '', $code);
+    if ($code === '' ) return false;
+    for ($i = -$window; $i <= $window; $i++) {
+        if (hash_equals(totpCode($secretBase32, time() + $i * 30), $code)) return true;
+    }
+    return false;
+}
+
+function totpOtpAuthUrl(string $secretBase32, string $username, string $issuer = 'MileageLog'): string {
+    return 'otpauth://totp/' . rawurlencode($issuer) . ':' . rawurlencode($username)
+        . '?secret=' . $secretBase32 . '&issuer=' . rawurlencode($issuer) . '&algorithm=SHA1&digits=6&period=30';
+}
+
+function totpGenerateBackupCodes(int $count = 8): array {
+    $codes = [];
+    for ($i = 0; $i < $count; $i++) {
+        $codes[] = substr(bin2hex(random_bytes(5)), 0, 8);
+    }
+    return $codes;
 }
